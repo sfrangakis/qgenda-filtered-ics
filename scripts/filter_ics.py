@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from icalendar import Calendar, Event, vCalAddress, vText
+from icalendar import Calendar, Event
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -16,16 +16,18 @@ RULES_JSON = os.environ.get("RULES_JSON", "").strip()
 
 DEFAULT_RULES = {
     "timezone": "America/Detroit",
-    "exclude": [],                   # ["Admin Flex", "PTO", "re:\\bShadow\\b"]
-    "rename": [],                    # [{"pattern": "^Facility\\s+", "repl": ""}]
+    "exclude": [],
+    "rename": [],
     "day_conflicts": {
         "enable": True,
-        "keep_priority": [],         # ["OR 1st Call", "EAA Late", ...]
-        "allow_multiple_per_day": False
+        "keep_priority": [],
+        "allow_multiple_per_day": True  # <- we’ll keep multiples by default
     },
-    "time_rules": [                  # For Outlook calendar ONLY
-        # {"pattern": "EAA Late", "start": "06:00", "end": "21:00"}
+    # NEW: pairwise rules that drop specific titles only when a preferred one is also present that day
+    "pairwise_same_day": [
+        # {"keep": "EAA Late", "drop": "EAA"}
     ],
+    "time_rules": [],
     "calendar_names": {
         "outlook": "QGenda (Outlook, filtered)",
         "magicmirror": "QGenda (MagicMirror, all-day, filtered)"
@@ -43,6 +45,8 @@ def load_rules():
             merged["day_conflicts"] = DEFAULT_RULES["day_conflicts"] | rules["day_conflicts"]
         if "calendar_names" in rules:
             merged["calendar_names"] = DEFAULT_RULES["calendar_names"] | rules["calendar_names"]
+        if "pairwise_same_day" in rules and not isinstance(rules["pairwise_same_day"], list):
+            raise ValueError("pairwise_same_day must be a list")
         return merged
     except Exception as e:
         logging.error(f"Failed to parse RULES_JSON: {e}")
@@ -64,29 +68,24 @@ def as_local_date(dt_value, tzname: str) -> date:
     else:
         raise TypeError("Unsupported DTSTART/DTEND type")
 
+def compile_matcher(pattern: str):
+    if not pattern:
+        return lambda s: False
+    pattern = pattern.strip()
+    if pattern.lower().startswith("re:"):
+        rx = re.compile(pattern[3:], re.IGNORECASE)
+        return lambda s, rx=rx: bool(rx.search(s or ""))
+    low = pattern.casefold()
+    return lambda s, low=low: low in (s or "").casefold()
+
 def compile_matchers(patterns_or_rules, key="pattern"):
-    """
-    Accepts list of strings or dicts with a 'pattern' key.
-    For strings: plain substring (case-insensitive) unless prefixed with 're:'.
-    For dicts: read dict[key]; same 're:' handling.
-    Returns list of (callable, original_item).
-    """
     matchers = []
     for item in patterns_or_rules:
         if isinstance(item, str):
             p = item.strip()
         else:
             p = str(item.get(key, "")).strip()
-        if not p:
-            # skip empty
-            matchers.append((lambda s: False, item))
-            continue
-        if p.lower().startswith("re:"):
-            rx = re.compile(p[3:], re.IGNORECASE)
-            matchers.append((lambda s, rx=rx: bool(rx.search(s or "")), item))
-        else:
-            low = p.casefold()
-            matchers.append((lambda s, low=low: low in (s or "").casefold(), item))
+        matchers.append((compile_matcher(p), item))
     return matchers
 
 def apply_renames(summary: str, rename_rules: list[dict]) -> str:
@@ -98,7 +97,6 @@ def apply_renames(summary: str, rename_rules: list[dict]) -> str:
             continue
         rx = re.compile(pattern, re.IGNORECASE)
         out = rx.sub(repl, out)
-    # tidy spaces/dashes
     out = re.sub(r"\s{2,}", " ", out).strip(" -\u2013\u2014")
     return out
 
@@ -140,17 +138,14 @@ def set_event_times_local(ev: Event, d: date, tzname: str, start_hhmm: str, end_
     eh, em = map(int, end_hhmm.split(":"))
     start_dt = datetime(d.year, d.month, d.day, sh, sm, tzinfo=tz)
     end_dt = datetime(d.year, d.month, d.day, eh, em, tzinfo=tz)
-    # Guard: if end <= start, push to next day (rare, but safe)
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
     ev["DTSTART"] = start_dt
     ev["DTEND"] = end_dt
 
 def set_event_all_day(ev: Event, d: date):
-    # All-day events: DTSTART is DATE; DTEND is next DATE (exclusive)
     ev["DTSTART"] = d
     ev["DTEND"] = d + timedelta(days=1)
-    # Remove any DTSTAMP/UID? Keep UID; GCal handles fine.
 
 def main():
     if not SOURCE_ICS_URL:
@@ -160,16 +155,23 @@ def main():
     rules = load_rules()
     tzname = rules.get("timezone") or "America/Detroit"
 
-    # Matchers
     exclude_matchers = compile_matchers(rules.get("exclude", []))
     rename_rules = rules.get("rename", [])
     dc = rules.get("day_conflicts", {})
     dc_enable = bool(dc.get("enable", True))
-    allow_multi = bool(dc.get("allow_multiple_per_day", False))
+    allow_multi = bool(dc.get("allow_multiple_per_day", True))
     scorer = make_priority_scorer(dc.get("keep_priority", []))
 
-    time_rule_matchers = compile_matchers(rules.get("time_rules", []))  # for Outlook
-    # make a helper to find first matching time rule
+    # NEW: compile pairwise keep/drop same-day rules
+    pairwise = rules.get("pairwise_same_day", []) or []
+    pairwise_compiled = []
+    for pr in pairwise:
+        keep_m = compile_matcher(str(pr.get("keep", "")))
+        drop_m = compile_matcher(str(pr.get("drop", "")))
+        pairwise_compiled.append((keep_m, drop_m))
+
+    # time rules (for Outlook)
+    time_rule_matchers = compile_matchers(rules.get("time_rules", []))
     def find_time_rule(summary: str):
         for test, item in time_rule_matchers:
             if test(summary):
@@ -180,10 +182,7 @@ def main():
     raw = fetch_ics(SOURCE_ICS_URL)
     src = Calendar.from_ical(raw)
 
-    # First pass: collect events, apply renames/excludes
-    kept = []
-    skipped_by_exclude = 0
-    renamed_count = 0
+    kept, skipped_by_exclude, renamed_count = [], 0, 0
     for ev in src.walk("VEVENT"):
         summary = str(ev.get("SUMMARY", "") or "")
         new_summary = apply_renames(summary, rename_rules)
@@ -195,78 +194,95 @@ def main():
             continue
         kept.append(ev)
 
-    # Resolve per-day conflicts (date in chosen timezone)
+    # Group by local calendar date
+    by_date = defaultdict(list)
+    for ev in kept:
+        d = as_local_date(ev.get("DTSTART").dt, tzname)
+        by_date[d].append(ev)
+
+    # Apply pairwise same-day drops (e.g., keep "EAA Late" drop "EAA")
+    dropped_by_pairwise = 0
+    kept_after_pairwise = []
+    for d, evs in by_date.items():
+        to_drop = set()
+        titles = [str(e.get("SUMMARY", "") or "") for e in evs]
+        for keep_m, drop_m in pairwise_compiled:
+            has_keep = any(keep_m(t) for t in titles)
+            if not has_keep:
+                continue
+            for idx, t in enumerate(titles):
+                if drop_m(t):
+                    to_drop.add(idx)
+        for idx, ev in enumerate(evs):
+            if idx not in to_drop:
+                kept_after_pairwise.append(ev)
+        dropped_by_pairwise += len(to_drop)
+
+    kept = kept_after_pairwise
+
+    # Optional classic "keep only one per day" resolver
     dropped_by_conflict = 0
     if dc_enable and not allow_multi:
-        by_date = defaultdict(list)
+        by_date2 = defaultdict(list)
         for ev in kept:
-            dt = ev.get("DTSTART").dt
-            d = as_local_date(dt, tzname)
-            by_date[d].append(ev)
-        kept_final = []
-        for d, evs in by_date.items():
+            d = as_local_date(ev.get("DTSTART").dt, tzname)
+            by_date2[d].append(ev)
+        final = []
+        for d, evs in by_date2.items():
             if len(evs) == 1:
-                kept_final.append(evs[0])
-                continue
-            best_ev = None
-            best_score = 10**9
+                final.append(evs[0]); continue
+            best_ev, best_score = None, 10**9
             for ev in evs:
                 s = str(ev.get("SUMMARY", "") or "")
                 sc = scorer(s)
                 if sc < best_score:
-                    best_score = sc
-                    best_ev = ev
+                    best_score, best_ev = sc, ev
             if best_ev is None:
                 evs_sorted = sorted(evs, key=lambda e: (as_local_date(e.get("DTSTART").dt, tzname), e.get("DTSTART").dt))
                 best_ev = evs_sorted[0]
-            kept_final.append(best_ev)
+            final.append(best_ev)
             dropped_by_conflict += (len(evs) - 1)
-        kept = kept_final
+        kept = final
 
-    # Build Outlook calendar (timed events) and MagicMirror (all-day)
-    cal_outlook = build_base_calendar(src, rules["calendar_names"].get("outlook"))
-    cal_magic = build_base_calendar(src, rules["calendar_names"].get("magicmirror"))
+    # Build calendars
+    cal_out = build_base_calendar(src, rules["calendar_names"].get("outlook"))
+    cal_mm  = build_base_calendar(src, rules["calendar_names"].get("magicmirror"))
 
     for ev in kept:
-        # Compute the local calendar date for assignment
         d = as_local_date(ev.get("DTSTART").dt, tzname)
-        summary = str(ev.get("SUMMARY", "") or "")
+        title = str(ev.get("SUMMARY", "") or "")
 
-        # --- Outlook version ---
-        ev_out = clone_event(ev)
-        rule = find_time_rule(summary)
-        if rule and rule.get("start") and rule.get("end"):
-            set_event_times_local(ev_out, d, tzname, rule["start"], rule["end"])
+        # Outlook: timed (override if rule present)
+        ev_o = copy.deepcopy(ev)
+        tr = find_time_rule(title)
+        if tr and tr.get("start") and tr.get("end"):
+            set_event_times_local(ev_o, d, tzname, tr["start"], tr["end"])
         else:
-            # If no rule, keep original timing as-is
-            # But ensure timezone-awareness if naive
-            dt = ev_out.get("DTSTART").dt
-            if isinstance(dt, datetime) and dt.tzinfo is None:
-                ev_out["DTSTART"] = dt.replace(tzinfo=ZoneInfo(tzname))
-            dtend = ev_out.get("DTEND")
-            if dtend:
-                dt2 = dtend.dt
-                if isinstance(dt2, datetime) and dt2.tzinfo is None:
-                    ev_out["DTEND"] = dt2.replace(tzinfo=ZoneInfo(tzname))
-        cal_outlook.add_component(ev_out)
+            # ensure tz-aware
+            for key in ["DTSTART","DTEND"]:
+                if key in ev_o:
+                    dt = ev_o.get(key).dt
+                    if isinstance(dt, datetime) and dt.tzinfo is None:
+                        ev_o[key] = dt.replace(tzinfo=ZoneInfo(tzname))
+        cal_out.add_component(ev_o)
 
-        # --- MagicMirror version (all-day) ---
-        ev_mm = clone_event(ev)
-        set_event_all_day(ev_mm, d)
-        cal_magic.add_component(ev_mm)
+        # MagicMirror: all-day
+        ev_m = copy.deepcopy(ev)
+        set_event_all_day(ev_m, d)
+        cal_mm.add_component(ev_m)
 
-    # Write both files
     os.makedirs(os.path.dirname(OUTPUT_OUTLOOK), exist_ok=True)
     with open(OUTPUT_OUTLOOK, "wb") as f:
-        f.write(cal_outlook.to_ical())
+        f.write(cal_out.to_ical())
 
     os.makedirs(os.path.dirname(OUTPUT_MAGIC), exist_ok=True)
     with open(OUTPUT_MAGIC, "wb") as f:
-        f.write(cal_magic.to_ical())
+        f.write(cal_mm.to_ical())
 
     logging.info(f"Renamed: {renamed_count}")
     logging.info(f"Excluded by rule: {skipped_by_exclude}")
-    logging.info(f"Dropped by day-conflict: {dropped_by_conflict}")
+    logging.info(f"Dropped by pairwise: {dropped_by_pairwise}")
+    logging.info(f"Dropped by conflict: {dropped_by_conflict}")
     logging.info(f"Wrote: {OUTPUT_OUTLOOK} and {OUTPUT_MAGIC}")
 
 if __name__ == "__main__":
