@@ -4,7 +4,8 @@
 QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
 
 - Title renames & exclusions
-- Pairwise same-day rule (e.g., keep "EAA Late" drop exact "EAA")
+- Pairwise same-day rule (keep "EAA Late", drop exact "EAA" when both exist)
+- Pairwise uses a normalized title so suffixes like " - Site X" don't break matching
 - Optional per-day conflict resolver (keep one by priority)
 - Outputs:
     docs/outlook.ics     (timed per time_rules; DEFAULT = all-day, marked BUSY)
@@ -148,7 +149,24 @@ def build_base_calendar_with_timezones(src: Calendar, name: str | None = None) -
             out.add_component(copy.deepcopy(comp))
     return out
 
-# ---------- Outlook helpers ----------
+# ---------------- Normalization helpers ----------------
+
+def normalize_title(s: str) -> str:
+    """
+    Make titles comparable for pairwise logic:
+      - Trim spaces
+      - Drop a trailing " - Site XYZ" or similar suffix
+    """
+    if not s:
+        return ""
+    t = s.strip()
+    # common trailing ' - Site X' / ' – Site X' / ' — Site X'
+    t = re.sub(r"\s*[-–—]\s*Site\s+\w+\s*$", "", t, flags=re.IGNORECASE)
+    # collapse spaces
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+# ---------------- Outlook helpers ----------------
 
 def _clear_all_day_flags(ev: Event):
     for k in ["X-MICROSOFT-CDO-ALLDAYEVENT", "TRANSP", "X-MICROSOFT-CDO-BUSYSTATUS"]:
@@ -157,7 +175,7 @@ def _clear_all_day_flags(ev: Event):
 
 def add_timed_with_tzid(ev: Event, field: str, dt_local_naive: datetime, tzname: str):
     """
-    Add a timed field with explicit TZID (RFC5545):
+    Timed field with explicit TZID (RFC5545):
       DTSTART;TZID=America/Detroit:YYYYMMDDTHHMMSS
     Using NAIVE local time + TZID is most reliable for Outlook.
     """
@@ -182,7 +200,7 @@ def set_event_times_local_outlook(ev: Event, d: date, tzname: str, start_hhmm: s
     ev["X-MICROSOFT-CDO-BUSYSTATUS"]  = "BUSY"
     ev["TRANSP"] = "OPAQUE"
 
-# ---------- All-day helper ----------
+# ---------------- All-day helper ----------------
 
 def set_event_all_day(ev: Event, d: date, busy: bool = True):
     """
@@ -253,17 +271,28 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         by_date[d].append(ev)
 
-    # pairwise same-day drops (never drop items that also match the 'keep' pattern)
+    # pairwise same-day drops (use normalized titles; never drop a 'keep' match)
     dropped_by_pairwise = 0
     kept_after_pairwise = []
     for d, evs in by_date.items():
         to_drop = set()
-        titles = [str(e.get("SUMMARY", "") or "") for e in evs]
+        titles_raw  = [str(e.get("SUMMARY", "") or "") for e in evs]
+        titles_norm = [normalize_title(t) for t in titles_raw]
+
+        # apply user-defined pairwise rules
         for keep_m, drop_m in pairwise_compiled:
-            keep_idx = {i for i, t in enumerate(titles) if keep_m(t)}
-            drop_idx = {i for i, t in enumerate(titles) if drop_m(t)}
-            drop_idx -= keep_idx  # protect 'keep' matches from being dropped
+            keep_idx = {i for i, t in enumerate(titles_norm) if keep_m(t)}
+            drop_idx = {i for i, t in enumerate(titles_norm) if drop_m(t)}
+            drop_idx -= keep_idx  # protect 'keep' matches
             to_drop |= drop_idx
+
+        # built-in safeguard for EAA Late vs EAA, even if user rules are missing/strict
+        has_eaa_late = any(re.match(r"^EAA\s+Late$", t, re.IGNORECASE) for t in titles_norm)
+        if has_eaa_late:
+            for i, t in enumerate(titles_norm):
+                if re.match(r"^EAA$", t, re.IGNORECASE):
+                    to_drop.add(i)
+
         for idx, ev in enumerate(evs):
             if idx not in to_drop:
                 kept_after_pairwise.append(ev)
