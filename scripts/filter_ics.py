@@ -4,18 +4,11 @@
 QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
 
 - Title renames & exclusions
-- Pairwise same-day rule (keep "EAA Late", drop exact "EAA" when both exist)
-- Pairwise uses a normalized title so suffixes like " - Site X" don't break matching
+- Pairwise same-day rule (keep "EAA Late", drop exact "EAASC" only when both exist)
 - Optional per-day conflict resolver (keep one by priority)
 - Outputs:
     docs/outlook.ics     (timed per time_rules; DEFAULT = all-day, marked BUSY)
     docs/magicmirror.ics (all-day, VALUE=DATE)
-
-ENV:
-  SOURCE_ICS_URL  : QGenda subscription ICS URL
-  OUTPUT_OUTLOOK  : path (default docs/outlook.ics)
-  OUTPUT_MAGIC    : path (default docs/magicmirror.ics)
-  RULES_JSON      : JSON config (exclude/rename/pairwise/time_rules, etc.)
 """
 
 import os, sys, json, re, logging, copy
@@ -143,26 +136,19 @@ def build_base_calendar_with_timezones(src: Calendar, name: str | None = None) -
             out[key] = src[key]
     if name:
         out["X-WR-CALNAME"] = name
-    # Copy VTIMEZONE and any other non-VEVENT components (helps Outlook)
+    # Copy VTIMEZONE and any other non-VEVENT components
     for comp in src.subcomponents:
         if getattr(comp, "name", None) != "VEVENT":
             out.add_component(copy.deepcopy(comp))
     return out
 
-# ---------------- Normalization helpers ----------------
+# -------- Normalization (for pairwise title matching) --------
 
 def normalize_title(s: str) -> str:
-    """
-    Make titles comparable for pairwise logic:
-      - Trim spaces
-      - Drop a trailing " - Site XYZ" or similar suffix
-    """
     if not s:
         return ""
     t = s.strip()
-    # common trailing ' - Site X' / ' – Site X' / ' — Site X'
     t = re.sub(r"\s*[-–—]\s*Site\s+\w+\s*$", "", t, flags=re.IGNORECASE)
-    # collapse spaces
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
@@ -174,11 +160,6 @@ def _clear_all_day_flags(ev: Event):
             del ev[k]
 
 def add_timed_with_tzid(ev: Event, field: str, dt_local_naive: datetime, tzname: str):
-    """
-    Timed field with explicit TZID (RFC5545):
-      DTSTART;TZID=America/Detroit:YYYYMMDDTHHMMSS
-    Using NAIVE local time + TZID is most reliable for Outlook.
-    """
     if field in ev:
         del ev[field]
     ev.add(field.lower(), dt_local_naive, parameters={"TZID": tzname})
@@ -186,7 +167,7 @@ def add_timed_with_tzid(ev: Event, field: str, dt_local_naive: datetime, tzname:
 def set_event_times_local_outlook(ev: Event, d: date, tzname: str, start_hhmm: str, end_hhmm: str):
     sh, sm = map(int, start_hhmm.split(":"))
     eh, em = map(int, end_hhmm.split(":"))
-    start_naive = datetime(d.year, d.month, d.day, sh, sm)  # NAIVE local
+    start_naive = datetime(d.year, d.month, d.day, sh, sm)
     end_naive   = datetime(d.year, d.month, d.day, eh, em)
     if end_naive <= start_naive:
         end_naive += timedelta(days=1)
@@ -195,7 +176,6 @@ def set_event_times_local_outlook(ev: Event, d: date, tzname: str, start_hhmm: s
     add_timed_with_tzid(ev, "DTSTART", start_naive, tzname)
     add_timed_with_tzid(ev, "DTEND",   end_naive,   tzname)
 
-    # Explicit busy/opaque so Outlook shows as BUSY
     ev["X-MICROSOFT-CDO-ALLDAYEVENT"] = "FALSE"
     ev["X-MICROSOFT-CDO-BUSYSTATUS"]  = "BUSY"
     ev["TRANSP"] = "OPAQUE"
@@ -203,11 +183,6 @@ def set_event_times_local_outlook(ev: Event, d: date, tzname: str, start_hhmm: s
 # ---------------- All-day helper ----------------
 
 def set_event_all_day(ev: Event, d: date, busy: bool = True):
-    """
-    True all-day event (DATE-only):
-      DTSTART;VALUE=DATE:YYYYMMDD
-      DTEND;VALUE=DATE:YYYYMMDD+1
-    """
     if "DTSTART" in ev: del ev["DTSTART"]
     if "DTEND"   in ev: del ev["DTEND"]
     ev["DTSTART"] = vDate(d)
@@ -271,27 +246,20 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         by_date[d].append(ev)
 
-    # pairwise same-day drops (use normalized titles; never drop a 'keep' match)
+    # pairwise same-day drops (only drop if the 'keep' pattern exists that day)
     dropped_by_pairwise = 0
     kept_after_pairwise = []
     for d, evs in by_date.items():
         to_drop = set()
-        titles_raw  = [str(e.get("SUMMARY", "") or "") for e in evs]
-        titles_norm = [normalize_title(t) for t in titles_raw]
+        titles_norm = [normalize_title(str(e.get("SUMMARY", "") or "")) for e in evs]
 
-        # apply user-defined pairwise rules
         for keep_m, drop_m in pairwise_compiled:
             keep_idx = {i for i, t in enumerate(titles_norm) if keep_m(t)}
+            if not keep_idx:
+                continue  # <-- critical fix: don't drop unless a keep-match exists
             drop_idx = {i for i, t in enumerate(titles_norm) if drop_m(t)}
-            drop_idx -= keep_idx  # protect 'keep' matches
+            drop_idx -= keep_idx  # never drop the keepers
             to_drop |= drop_idx
-
-        # built-in safeguard for EAA Late vs EAA, even if user rules are missing/strict
-        has_eaa_late = any(re.match(r"^EAA\s+Late$", t, re.IGNORECASE) for t in titles_norm)
-        if has_eaa_late:
-            for i, t in enumerate(titles_norm):
-                if re.match(r"^EAA$", t, re.IGNORECASE):
-                    to_drop.add(i)
 
         for idx, ev in enumerate(evs):
             if idx not in to_drop:
@@ -323,7 +291,7 @@ def main():
             dropped_by_conflict += (len(evs) - 1)
         kept = final
 
-    # build output calendars (copy VTIMEZONE etc. for Outlook compatibility)
+    # build output calendars
     cal_out = build_base_calendar_with_timezones(src, rules["calendar_names"].get("outlook"))
     cal_mm  = build_base_calendar_with_timezones(src, rules["calendar_names"].get("magicmirror"))
 
