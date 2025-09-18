@@ -23,8 +23,8 @@ from icalendar import Calendar, Event, vDate
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 SOURCE_ICS_URL = os.environ.get("SOURCE_ICS_URL", "").strip()
-OUTPUT_OUTLOOK = os.environ.get("OUTPUT_OUTLOOK", "docs/outlook.ics")
-OUTPUT_MAGIC   = os.environ.get("OUTPUT_MAGIC",   "docs/magicmirror.ics")
+OUTPUT_OUTLOOK = os.environ.get("OUTPUT_OUTLOOK", "docs/outlook_v2.ics")
+OUTPUT_MAGIC   = os.environ.get("OUTPUT_MAGIC",   "docs/magicmirror_v2.ics")
 RULES_JSON     = os.environ.get("RULES_JSON", "").strip()
 
 DEFAULT_RULES = {
