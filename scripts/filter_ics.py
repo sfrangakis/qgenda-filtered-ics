@@ -6,18 +6,19 @@ QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
 - Title renames & exclusions
 - Pairwise same-day rule (keep "EAA Late", drop exact "EAASC" only when both exist)
 - Optional per-day conflict resolver (keep one by priority)
+- Rewrites UIDs per output calendar to avoid cross-calendar de-duplication
 - Outputs:
-    docs/outlook.ics     (timed per time_rules; DEFAULT = all-day, marked BUSY)
-    docs/magicmirror.ics (all-day, VALUE=DATE)
+    docs/outlook.ics     (timed per time_rules; DEFAULT = all-day, BUSY/OPAQUE)
+    docs/magicmirror.ics (all-day VALUE=DATE, BUSY/OPAQUE)
 """
 
-import os, sys, json, re, logging, copy
+import os, sys, json, re, logging, copy, hashlib
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from icalendar import Calendar, Event, vDate, vText
+from icalendar import Calendar, Event, vDate
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -191,6 +192,24 @@ def set_event_all_day(ev: Event, d: date, busy: bool = True):
     ev["X-MICROSOFT-CDO-BUSYSTATUS"]  = "BUSY" if busy else "FREE"
     ev["TRANSP"] = "OPAQUE" if busy else "TRANSPARENT"
 
+# ---------------- UID rewrite (avoid cross-calendar de-dup) ----------------
+
+def rewrite_uid(ev: Event, calendar_tag: str):
+    """
+    Make a stable, calendar-specific UID from the original UID + tag.
+    This avoids collisions with other calendars (e.g., original QGenda)
+    and between our two outputs.
+    """
+    orig = str(ev.get("UID", "")) or ""
+    # Include DTSTART (as text) for stability if source has repeated UIDs across dates
+    dtstart_txt = ""
+    if "DTSTART" in ev:
+        dtstart_txt = str(ev["DTSTART"])
+
+    base = f"{orig}|{dtstart_txt}|{calendar_tag}"
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
+    ev["UID"] = f"{digest}@filtered.local"
+
 def main():
     if not SOURCE_ICS_URL:
         logging.error("SOURCE_ICS_URL is not set.")
@@ -246,7 +265,7 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         by_date[d].append(ev)
 
-    # pairwise same-day drops (only drop if the 'keep' pattern exists that day)
+    # pairwise same-day drops (only drop if a keep-match exists that day)
     dropped_by_pairwise = 0
     kept_after_pairwise = []
     for d, evs in by_date.items():
@@ -256,9 +275,9 @@ def main():
         for keep_m, drop_m in pairwise_compiled:
             keep_idx = {i for i, t in enumerate(titles_norm) if keep_m(t)}
             if not keep_idx:
-                continue  # <-- critical fix: don't drop unless a keep-match exists
+                continue
             drop_idx = {i for i, t in enumerate(titles_norm) if drop_m(t)}
-            drop_idx -= keep_idx  # never drop the keepers
+            drop_idx -= keep_idx
             to_drop |= drop_idx
 
         for idx, ev in enumerate(evs):
@@ -306,11 +325,13 @@ def main():
             set_event_times_local_outlook(ev_out, d, tzname, rule["start"], rule["end"])
         else:
             set_event_all_day(ev_out, d, busy=True)
+        rewrite_uid(ev_out, "OUTLOOK")
         cal_out.add_component(ev_out)
 
-        # --- MagicMirror (always all-day, FREE/transparent) ---
+        # --- MagicMirror (always all-day, BUSY so it's clearly visible) ---
         ev_mm = copy.deepcopy(ev)
-        set_event_all_day(ev_mm, d, busy=False)
+        set_event_all_day(ev_mm, d, busy=True)
+        rewrite_uid(ev_mm, "MAGIC")
         cal_mm.add_component(ev_mm)
 
     # write files
