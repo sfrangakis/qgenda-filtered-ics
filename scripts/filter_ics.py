@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
-import os, sys, json, re, logging, copy
+# coding: utf-8
+"""
+QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
+
+- Applies title renames and exclusions
+- Pairwise same-day rule (e.g., if "EAA Late" present, drop "EAA" that day)
+- Optional per-day conflict resolver (keep one by priority)
+- Builds:
+    docs/outlook.ics     (timed per time_rules; default = all-day)
+    docs/magicmirror.ics (all-day)
+
+Configure via ENV:
+  SOURCE_ICS_URL  : QGenda subscription ICS URL
+  OUTPUT_OUTLOOK  : path for timed ICS (default docs/outlook.ics)
+  OUTPUT_MAGIC    : path for all-day ICS (default docs/magicmirror.ics)
+  RULES_JSON      : JSON with filters/renames/times (see README / prior message)
+"""
+
+import os
+import sys
+import json
+import re
+import logging
+import copy
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -16,23 +39,27 @@ RULES_JSON = os.environ.get("RULES_JSON", "").strip()
 
 DEFAULT_RULES = {
     "timezone": "America/Detroit",
-    "exclude": [],
-    "rename": [],
+    "exclude": [],          # ["Admin Flex", "PTO", "re:\\bShadow\\b"]
+    "rename": [],           # [{"pattern":"^Facility\\s+","repl":""}, ...]
     "day_conflicts": {
         "enable": True,
-        "keep_priority": [],
-        "allow_multiple_per_day": True  # <- we’ll keep multiples by default
+        "keep_priority": [],            # ["OR 1st Call", "EAA Late", ...]
+        "allow_multiple_per_day": True  # default keep multiples; set False to force single
     },
-    # NEW: pairwise rules that drop specific titles only when a preferred one is also present that day
+    # Drop Y only if X exists on the same local date
     "pairwise_same_day": [
         # {"keep": "EAA Late", "drop": "EAA"}
     ],
-    "time_rules": [],
+    # Applies ONLY to Outlook calendar; anything not matched becomes all-day
+    "time_rules": [
+        # {"pattern": "OB Overnight", "start": "16:00", "end": "07:00"},
+    ],
     "calendar_names": {
         "outlook": "QGenda (Outlook, filtered)",
         "magicmirror": "QGenda (MagicMirror, all-day, filtered)"
     }
 }
+
 
 def load_rules():
     if not RULES_JSON:
@@ -52,10 +79,12 @@ def load_rules():
         logging.error(f"Failed to parse RULES_JSON: {e}")
         sys.exit(1)
 
+
 def fetch_ics(url: str) -> bytes:
     r = requests.get(url, timeout=45)
     r.raise_for_status()
     return r.content
+
 
 def as_local_date(dt_value, tzname: str) -> date:
     tz = ZoneInfo(tzname)
@@ -68,15 +97,17 @@ def as_local_date(dt_value, tzname: str) -> date:
     else:
         raise TypeError("Unsupported DTSTART/DTEND type")
 
+
 def compile_matcher(pattern: str):
     if not pattern:
         return lambda s: False
-    pattern = pattern.strip()
-    if pattern.lower().startswith("re:"):
-        rx = re.compile(pattern[3:], re.IGNORECASE)
+    p = pattern.strip()
+    if p.lower().startswith("re:"):
+        rx = re.compile(p[3:], re.IGNORECASE)
         return lambda s, rx=rx: bool(rx.search(s or ""))
-    low = pattern.casefold()
+    low = p.casefold()
     return lambda s, low=low: low in (s or "").casefold()
+
 
 def compile_matchers(patterns_or_rules, key="pattern"):
     matchers = []
@@ -88,6 +119,7 @@ def compile_matchers(patterns_or_rules, key="pattern"):
         matchers.append((compile_matcher(p), item))
     return matchers
 
+
 def apply_renames(summary: str, rename_rules: list[dict]) -> str:
     out = summary or ""
     for rule in rename_rules:
@@ -97,8 +129,10 @@ def apply_renames(summary: str, rename_rules: list[dict]) -> str:
             continue
         rx = re.compile(pattern, re.IGNORECASE)
         out = rx.sub(repl, out)
+    # normalize spaces/dashes
     out = re.sub(r"\s{2,}", " ", out).strip(" -\u2013\u2014")
     return out
+
 
 def make_priority_scorer(priority_list):
     compiled = []
@@ -107,6 +141,7 @@ def make_priority_scorer(priority_list):
             compiled.append((idx, re.compile(p[3:], re.IGNORECASE), True))
         else:
             compiled.append((idx, p.casefold(), False))
+
     def score(summary: str) -> int:
         s = (summary or "").casefold()
         best = 10**9
@@ -120,8 +155,6 @@ def make_priority_scorer(priority_list):
         return best
     return score
 
-def clone_event(ev: Event) -> Event:
-    return copy.deepcopy(ev)
 
 def build_base_calendar(src: Calendar, name: str | None = None) -> Calendar:
     out = Calendar()
@@ -132,20 +165,25 @@ def build_base_calendar(src: Calendar, name: str | None = None) -> Calendar:
         out["X-WR-CALNAME"] = name
     return out
 
+
 def set_event_times_local(ev: Event, d: date, tzname: str, start_hhmm: str, end_hhmm: str):
     tz = ZoneInfo(tzname)
     sh, sm = map(int, start_hhmm.split(":"))
     eh, em = map(int, end_hhmm.split(":"))
     start_dt = datetime(d.year, d.month, d.day, sh, sm, tzinfo=tz)
     end_dt = datetime(d.year, d.month, d.day, eh, em, tzinfo=tz)
+    # If end <= start, roll end to next day (overnight)
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
     ev["DTSTART"] = start_dt
     ev["DTEND"] = end_dt
 
+
 def set_event_all_day(ev: Event, d: date):
+    # All-day: DTSTART is DATE; DTEND is next DATE (exclusive)
     ev["DTSTART"] = d
     ev["DTEND"] = d + timedelta(days=1)
+
 
 def main():
     if not SOURCE_ICS_URL:
@@ -155,14 +193,15 @@ def main():
     rules = load_rules()
     tzname = rules.get("timezone") or "America/Detroit"
 
+    # matchers & helpers
     exclude_matchers = compile_matchers(rules.get("exclude", []))
     rename_rules = rules.get("rename", [])
+
     dc = rules.get("day_conflicts", {})
     dc_enable = bool(dc.get("enable", True))
     allow_multi = bool(dc.get("allow_multiple_per_day", True))
     scorer = make_priority_scorer(dc.get("keep_priority", []))
 
-    # NEW: compile pairwise keep/drop same-day rules
     pairwise = rules.get("pairwise_same_day", []) or []
     pairwise_compiled = []
     for pr in pairwise:
@@ -170,7 +209,6 @@ def main():
         drop_m = compile_matcher(str(pr.get("drop", "")))
         pairwise_compiled.append((keep_m, drop_m))
 
-    # time rules (for Outlook)
     time_rule_matchers = compile_matchers(rules.get("time_rules", []))
     def find_time_rule(summary: str):
         for test, item in time_rule_matchers:
@@ -182,7 +220,10 @@ def main():
     raw = fetch_ics(SOURCE_ICS_URL)
     src = Calendar.from_ical(raw)
 
-    kept, skipped_by_exclude, renamed_count = [], 0, 0
+    # pass 1: rename + exclude
+    kept = []
+    skipped_by_exclude = 0
+    renamed_count = 0
     for ev in src.walk("VEVENT"):
         summary = str(ev.get("SUMMARY", "") or "")
         new_summary = apply_renames(summary, rename_rules)
@@ -194,13 +235,13 @@ def main():
             continue
         kept.append(ev)
 
-    # Group by local calendar date
+    # group by local date
     by_date = defaultdict(list)
     for ev in kept:
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         by_date[d].append(ev)
 
-    # Apply pairwise same-day drops (e.g., keep "EAA Late" drop "EAA")
+    # pairwise same-day drops (e.g., keep "EAA Late" drop "EAA")
     dropped_by_pairwise = 0
     kept_after_pairwise = []
     for d, evs in by_date.items():
@@ -217,10 +258,9 @@ def main():
             if idx not in to_drop:
                 kept_after_pairwise.append(ev)
         dropped_by_pairwise += len(to_drop)
-
     kept = kept_after_pairwise
 
-    # Optional classic "keep only one per day" resolver
+    # optional classic one-per-day resolver
     dropped_by_conflict = 0
     if dc_enable and not allow_multi:
         by_date2 = defaultdict(list)
@@ -230,7 +270,8 @@ def main():
         final = []
         for d, evs in by_date2.items():
             if len(evs) == 1:
-                final.append(evs[0]); continue
+                final.append(evs[0])
+                continue
             best_ev, best_score = None, 10**9
             for ev in evs:
                 s = str(ev.get("SUMMARY", "") or "")
@@ -244,7 +285,7 @@ def main():
             dropped_by_conflict += (len(evs) - 1)
         kept = final
 
-    # Build calendars
+    # build output calendars
     cal_out = build_base_calendar(src, rules["calendar_names"].get("outlook"))
     cal_mm  = build_base_calendar(src, rules["calendar_names"].get("magicmirror"))
 
@@ -252,25 +293,22 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         title = str(ev.get("SUMMARY", "") or "")
 
-        # Outlook: timed (override if rule present)
-        ev_o = copy.deepcopy(ev)
-        tr = find_time_rule(title)
-        if tr and tr.get("start") and tr.get("end"):
-            set_event_times_local(ev_o, d, tzname, tr["start"], tr["end"])
+        # --- Outlook (timed if rule matches; otherwise all-day) ---
+        ev_out = copy.deepcopy(ev)
+        rule = find_time_rule(title)
+        if rule and rule.get("start") and rule.get("end"):
+            set_event_times_local(ev_out, d, tzname, rule["start"], rule["end"])
         else:
-            # ensure tz-aware
-            for key in ["DTSTART","DTEND"]:
-                if key in ev_o:
-                    dt = ev_o.get(key).dt
-                    if isinstance(dt, datetime) and dt.tzinfo is None:
-                        ev_o[key] = dt.replace(tzinfo=ZoneInfo(tzname))
-        cal_out.add_component(ev_o)
+            # DEFAULT for Outlook: all-day when no time rule applies
+            set_event_all_day(ev_out, d)
+        cal_out.add_component(ev_out)
 
-        # MagicMirror: all-day
-        ev_m = copy.deepcopy(ev)
-        set_event_all_day(ev_m, d)
-        cal_mm.add_component(ev_m)
+        # --- MagicMirror (always all-day) ---
+        ev_mm = copy.deepcopy(ev)
+        set_event_all_day(ev_mm, d)
+        cal_mm.add_component(ev_mm)
 
+    # write files
     os.makedirs(os.path.dirname(OUTPUT_OUTLOOK), exist_ok=True)
     with open(OUTPUT_OUTLOOK, "wb") as f:
         f.write(cal_out.to_ical())
@@ -284,6 +322,7 @@ def main():
     logging.info(f"Dropped by pairwise: {dropped_by_pairwise}")
     logging.info(f"Dropped by conflict: {dropped_by_conflict}")
     logging.info(f"Wrote: {OUTPUT_OUTLOOK} and {OUTPUT_MAGIC}")
+
 
 if __name__ == "__main__":
     main()
