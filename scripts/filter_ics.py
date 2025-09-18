@@ -4,7 +4,7 @@
 QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
 
 - Title renames & exclusions
-- Pairwise same-day rule (e.g., if "EAA Late" present, drop "EAA")
+- Pairwise same-day rule (e.g., keep "EAA Late" drop exact "EAA")
 - Optional per-day conflict resolver (keep one by priority)
 - Outputs:
     docs/outlook.ics     (timed per time_rules; DEFAULT = all-day, marked BUSY)
@@ -151,12 +151,9 @@ def build_base_calendar_with_timezones(src: Calendar, name: str | None = None) -
 # ---------- Outlook helpers ----------
 
 def _clear_all_day_flags(ev: Event):
-    if "X-MICROSOFT-CDO-ALLDAYEVENT" in ev:
-        del ev["X-MICROSOFT-CDO-ALLDAYEVENT"]
-    if "TRANSP" in ev:
-        del ev["TRANSP"]
-    if "X-MICROSOFT-CDO-BUSYSTATUS" in ev:
-        del ev["X-MICROSOFT-CDO-BUSYSTATUS"]
+    for k in ["X-MICROSOFT-CDO-ALLDAYEVENT", "TRANSP", "X-MICROSOFT-CDO-BUSYSTATUS"]:
+        if k in ev:
+            del ev[k]
 
 def add_timed_with_tzid(ev: Event, field: str, dt_local_naive: datetime, tzname: str):
     """
@@ -197,7 +194,6 @@ def set_event_all_day(ev: Event, d: date, busy: bool = True):
     if "DTEND"   in ev: del ev["DTEND"]
     ev["DTSTART"] = vDate(d)
     ev["DTEND"]   = vDate(d + timedelta(days=1))
-    # Mark for Outlook; default to BUSY per user preference
     ev["X-MICROSOFT-CDO-ALLDAYEVENT"] = "TRUE"
     ev["X-MICROSOFT-CDO-BUSYSTATUS"]  = "BUSY" if busy else "FREE"
     ev["TRANSP"] = "OPAQUE" if busy else "TRANSPARENT"
@@ -257,19 +253,17 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         by_date[d].append(ev)
 
-    # pairwise same-day drops
+    # pairwise same-day drops (never drop items that also match the 'keep' pattern)
     dropped_by_pairwise = 0
     kept_after_pairwise = []
     for d, evs in by_date.items():
         to_drop = set()
         titles = [str(e.get("SUMMARY", "") or "") for e in evs]
         for keep_m, drop_m in pairwise_compiled:
-            has_keep = any(keep_m(t) for t in titles)
-            if not has_keep:
-                continue
-            for idx, t in enumerate(titles):
-                if drop_m(t):
-                    to_drop.add(idx)
+            keep_idx = {i for i, t in enumerate(titles) if keep_m(t)}
+            drop_idx = {i for i, t in enumerate(titles) if drop_m(t)}
+            drop_idx -= keep_idx  # protect 'keep' matches from being dropped
+            to_drop |= drop_idx
         for idx, ev in enumerate(evs):
             if idx not in to_drop:
                 kept_after_pairwise.append(ev)
@@ -308,16 +302,16 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         title = str(ev.get("SUMMARY", "") or "")
 
-        # --- Outlook (timed if rule matches; else all-day) ---
+        # --- Outlook (timed if rule matches; else all-day BUSY) ---
         ev_out = copy.deepcopy(ev)
         rule = find_time_rule(title)
         if rule and rule.get("start") and rule.get("end"):
             set_event_times_local_outlook(ev_out, d, tzname, rule["start"], rule["end"])
         else:
-            set_event_all_day(ev_out, d, busy=True)  # default all-day → BUSY
+            set_event_all_day(ev_out, d, busy=True)
         cal_out.add_component(ev_out)
 
-        # --- MagicMirror (always all-day, FREE/transparent is fine here) ---
+        # --- MagicMirror (always all-day, FREE/transparent) ---
         ev_mm = copy.deepcopy(ev)
         set_event_all_day(ev_mm, d, busy=False)
         cal_mm.add_component(ev_mm)
