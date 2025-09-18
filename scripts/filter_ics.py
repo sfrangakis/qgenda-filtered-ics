@@ -10,11 +10,11 @@ QGenda → two cleaned ICS calendars (Outlook timed + MagicMirror all-day)
     docs/outlook.ics     (timed per time_rules; default = all-day)
     docs/magicmirror.ics (all-day)
 
-Configure via ENV:
+ENV:
   SOURCE_ICS_URL  : QGenda subscription ICS URL
   OUTPUT_OUTLOOK  : path for timed ICS (default docs/outlook.ics)
   OUTPUT_MAGIC    : path for all-day ICS (default docs/magicmirror.ics)
-  RULES_JSON      : JSON with filters/renames/times (see README / prior message)
+  RULES_JSON      : JSON config (exclude/rename/pairwise/time_rules, etc.)
 """
 
 import os
@@ -28,38 +28,31 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from icalendar import Calendar, Event, vDate  # <-- vDate ensures VALUE=DATE for all-day
+from icalendar import Calendar, Event, vDate, vText
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 SOURCE_ICS_URL = os.environ.get("SOURCE_ICS_URL", "").strip()
 OUTPUT_OUTLOOK = os.environ.get("OUTPUT_OUTLOOK", "docs/outlook.ics")
-OUTPUT_MAGIC = os.environ.get("OUTPUT_MAGIC", "docs/magicmirror.ics")
-RULES_JSON = os.environ.get("RULES_JSON", "").strip()
+OUTPUT_MAGIC   = os.environ.get("OUTPUT_MAGIC",   "docs/magicmirror.ics")
+RULES_JSON     = os.environ.get("RULES_JSON", "").strip()
 
 DEFAULT_RULES = {
     "timezone": "America/Detroit",
-    "exclude": [],          # ["Admin Flex", "PTO", "re:\\bShadow\\b"]
-    "rename": [],           # [{"pattern":"^Facility\\s+","repl":""}, ...]
+    "exclude": [],
+    "rename": [],
     "day_conflicts": {
         "enable": True,
-        "keep_priority": [],            # ["OR 1st Call", "EAA Late", ...]
-        "allow_multiple_per_day": True  # default keep multiples; set False to force single
+        "keep_priority": [],
+        "allow_multiple_per_day": True
     },
-    # Drop Y only if X exists on the same local date
-    "pairwise_same_day": [
-        # {"keep": "EAA Late", "drop": "EAA"}
-    ],
-    # Applies ONLY to Outlook calendar; anything not matched becomes all-day
-    "time_rules": [
-        # {"pattern": "OB Overnight", "start": "16:00", "end": "07:00"},
-    ],
+    "pairwise_same_day": [],
+    "time_rules": [],
     "calendar_names": {
         "outlook": "QGenda (Outlook, filtered)",
         "magicmirror": "QGenda (MagicMirror, all-day, filtered)"
     }
 }
-
 
 def load_rules():
     if not RULES_JSON:
@@ -79,12 +72,10 @@ def load_rules():
         logging.error(f"Failed to parse RULES_JSON: {e}")
         sys.exit(1)
 
-
 def fetch_ics(url: str) -> bytes:
     r = requests.get(url, timeout=45)
     r.raise_for_status()
     return r.content
-
 
 def as_local_date(dt_value, tzname: str) -> date:
     tz = ZoneInfo(tzname)
@@ -97,7 +88,6 @@ def as_local_date(dt_value, tzname: str) -> date:
     else:
         raise TypeError("Unsupported DTSTART/DTEND type")
 
-
 def compile_matcher(pattern: str):
     if not pattern:
         return lambda s: False
@@ -108,7 +98,6 @@ def compile_matcher(pattern: str):
     low = p.casefold()
     return lambda s, low=low: low in (s or "").casefold()
 
-
 def compile_matchers(patterns_or_rules, key="pattern"):
     matchers = []
     for item in patterns_or_rules:
@@ -118,7 +107,6 @@ def compile_matchers(patterns_or_rules, key="pattern"):
             p = str(item.get(key, "")).strip()
         matchers.append((compile_matcher(p), item))
     return matchers
-
 
 def apply_renames(summary: str, rename_rules: list[dict]) -> str:
     out = summary or ""
@@ -133,7 +121,6 @@ def apply_renames(summary: str, rename_rules: list[dict]) -> str:
     out = re.sub(r"\s{2,}", " ", out).strip(" -\u2013\u2014")
     return out
 
-
 def make_priority_scorer(priority_list):
     compiled = []
     for idx, p in enumerate(priority_list):
@@ -141,7 +128,6 @@ def make_priority_scorer(priority_list):
             compiled.append((idx, re.compile(p[3:], re.IGNORECASE), True))
         else:
             compiled.append((idx, p.casefold(), False))
-
     def score(summary: str) -> int:
         s = (summary or "").casefold()
         best = 10**9
@@ -155,7 +141,6 @@ def make_priority_scorer(priority_list):
         return best
     return score
 
-
 def build_base_calendar(src: Calendar, name: str | None = None) -> Calendar:
     out = Calendar()
     for key in ["PRODID", "VERSION", "CALSCALE", "METHOD", "X-WR-TIMEZONE"]:
@@ -165,29 +150,50 @@ def build_base_calendar(src: Calendar, name: str | None = None) -> Calendar:
         out["X-WR-CALNAME"] = name
     return out
 
+def add_timed_with_tz(ev: Event, field: str, dt: datetime, tzname: str):
+    """
+    Add a timed field with explicit TZID param so Outlook renders reliably:
+      DTSTART;TZID=America/Detroit:20251128T070000
+    """
+    # Remove any existing field to avoid leftover VALUE=DATE params
+    if field in ev:
+        del ev[field]
+    # Format local "floating" wall time with explicit TZID param
+    # icalendar will format as YYYYMMDDTHHMMSS by default.
+    ev.add(field.lower(), dt, parameters={"TZID": vText(tzname)})
 
-def set_event_times_local(ev: Event, d: date, tzname: str, start_hhmm: str, end_hhmm: str):
+def set_event_times_local_outlook(ev: Event, d: date, tzname: str, start_hhmm: str, end_hhmm: str):
     tz = ZoneInfo(tzname)
     sh, sm = map(int, start_hhmm.split(":"))
     eh, em = map(int, end_hhmm.split(":"))
     start_dt = datetime(d.year, d.month, d.day, sh, sm, tzinfo=tz)
-    end_dt = datetime(d.year, d.month, d.day, eh, em, tzinfo=tz)
-    # If end <= start, roll end to next day (overnight)
+    end_dt   = datetime(d.year, d.month, d.day, eh, em, tzinfo=tz)
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
-    ev["DTSTART"] = start_dt
-    ev["DTEND"] = end_dt
 
+    add_timed_with_tz(ev, "DTSTART", start_dt, tzname)
+    add_timed_with_tz(ev, "DTEND",   end_dt,   tzname)
+
+    # Clean up all-day flags that confuse Outlook
+    if "X-MICROSOFT-CDO-ALLDAYEVENT" in ev:
+        del ev["X-MICROSOFT-CDO-ALLDAYEVENT"]
+    # Set explicit non-all-day hints Outlook understands
+    ev["X-MICROSOFT-CDO-ALLDAYEVENT"] = "FALSE"
+    ev["X-MICROSOFT-CDO-BUSYSTATUS"] = "BUSY"
+    ev["TRANSP"] = "OPAQUE"
 
 def set_event_all_day(ev: Event, d: date):
     """
-    Write proper all-day fields so GCal/Outlook import & display correctly:
+    True all-day event (DATE-only) for GCal/Outlook:
       DTSTART;VALUE=DATE:YYYYMMDD
-      DTEND;VALUE=DATE:YYYYMMDD+1 (exclusive)
+      DTEND;VALUE=DATE:YYYYMMDD+1
     """
     ev["DTSTART"] = vDate(d)
-    ev["DTEND"] = vDate(d + timedelta(days=1))
-
+    ev["DTEND"]   = vDate(d + timedelta(days=1))
+    # Mark as all-day for Outlook (optional but harmless)
+    ev["X-MICROSOFT-CDO-ALLDAYEVENT"] = "TRUE"
+    ev["X-MICROSOFT-CDO-BUSYSTATUS"] = "FREE"
+    ev["TRANSP"] = "TRANSPARENT"
 
 def main():
     if not SOURCE_ICS_URL:
@@ -197,12 +203,11 @@ def main():
     rules = load_rules()
     tzname = rules.get("timezone") or "America/Detroit"
 
-    # matchers & helpers
     exclude_matchers = compile_matchers(rules.get("exclude", []))
     rename_rules = rules.get("rename", [])
 
     dc = rules.get("day_conflicts", {})
-    dc_enable = bool(dc.get("enable", True))
+    dc_enable  = bool(dc.get("enable", True))
     allow_multi = bool(dc.get("allow_multiple_per_day", True))
     scorer = make_priority_scorer(dc.get("keep_priority", []))
 
@@ -297,18 +302,24 @@ def main():
         d = as_local_date(ev.get("DTSTART").dt, tzname)
         title = str(ev.get("SUMMARY", "") or "")
 
-        # --- Outlook (timed if rule matches; otherwise all-day) ---
+        # --- Outlook (timed if rule matches; else all-day) ---
         ev_out = copy.deepcopy(ev)
         rule = find_time_rule(title)
         if rule and rule.get("start") and rule.get("end"):
-            set_event_times_local(ev_out, d, tzname, rule["start"], rule["end"])
+            set_event_times_local_outlook(ev_out, d, tzname, rule["start"], rule["end"])
         else:
-            # DEFAULT for Outlook: all-day when no time rule applies
+            # Default to all-day in Outlook when no time rule
+            # (ensure any stray timed params/flags are cleared)
+            if "DTSTART" in ev_out: del ev_out["DTSTART"]
+            if "DTEND" in ev_out:   del ev_out["DTEND"]
             set_event_all_day(ev_out, d)
         cal_out.add_component(ev_out)
 
         # --- MagicMirror (always all-day) ---
         ev_mm = copy.deepcopy(ev)
+        # ensure clean DATE values
+        if "DTSTART" in ev_mm: del ev_mm["DTSTART"]
+        if "DTEND" in ev_mm:   del ev_mm["DTEND"]
         set_event_all_day(ev_mm, d)
         cal_mm.add_component(ev_mm)
 
@@ -326,7 +337,6 @@ def main():
     logging.info(f"Dropped by pairwise: {dropped_by_pairwise}")
     logging.info(f"Dropped by conflict: {dropped_by_conflict}")
     logging.info(f"Wrote: {OUTPUT_OUTLOOK} and {OUTPUT_MAGIC}")
-
 
 if __name__ == "__main__":
     main()
