@@ -28,7 +28,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from icalendar import Calendar, Event
+from icalendar import Calendar, Event, vDate  # <-- vDate ensures VALUE=DATE for all-day
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -180,9 +180,13 @@ def set_event_times_local(ev: Event, d: date, tzname: str, start_hhmm: str, end_
 
 
 def set_event_all_day(ev: Event, d: date):
-    # All-day: DTSTART is DATE; DTEND is next DATE (exclusive)
-    ev["DTSTART"] = d
-    ev["DTEND"] = d + timedelta(days=1)
+    """
+    Write proper all-day fields so GCal/Outlook import & display correctly:
+      DTSTART;VALUE=DATE:YYYYMMDD
+      DTEND;VALUE=DATE:YYYYMMDD+1 (exclusive)
+    """
+    ev["DTSTART"] = vDate(d)
+    ev["DTEND"] = vDate(d + timedelta(days=1))
 
 
 def main():
